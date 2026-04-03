@@ -1,4 +1,4 @@
-# 玉米生育期识别 · 论文复现/审稿用发布包
+# 玉米生育期识别 · 论文复现
 
 本目录为独立于主仓库路径的**可打包上传**版本：含测试脚本、与训练一致的模型代码、**不含**大体积权重文件（请自行放入 `weights/` 或审稿通过后单独托管）。
 
@@ -24,7 +24,7 @@ github/
 
    `weights/improved_corn_model_best.pth`
 
-2. 若期刊要求**开放存档**：建议将权重上传 **Zenodo / Figshare** 等获取 DOI，在论文 **Data Availability** 中写 DOI；GitHub 仅保留代码与本说明。
+
 
 默认测试参数已指向上述相对路径，**不再使用**任何 `D:\...` 绝对路径。
 
@@ -70,9 +70,7 @@ python scripts/test_improved_corn_growth_model.py ^
 
 ## 与主仓库的关系
 
-- `src/` 中文件从 `D:\code\cornmx\src\` **同步拷贝**；若主仓库模型代码有更新，发版前请重新复制并提交。
-- 主仓库完整训练代码未全部包含在此包内；期刊若只要求 **权重 + 测试说明**，当前内容通常可满足。
 
 ## 许可与数据
 
-请根据期刊要求在正文中补充 **Acknowledgments / Funding / Data Availability**；若原始影像不可公开，在 Data Availability 中说明**仅提供示例子集与推理脚本**。
+

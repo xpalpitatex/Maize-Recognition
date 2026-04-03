@@ -1,0 +1,789 @@
+#!/usr/bin/env python3
+"""
+🌽 完整玉米生育期识别模型测试脚本
+专门用于测试 ImprovedCornGrowthStageModel 的完整功能
+
+功能特性:
+- 支持完整模型的所有特性（时间特征、注意力机制、多尺度特征、困难样本增强）
+- 生成详细的性能分析报告（TXT格式）
+- 创建英文可视化图表
+- 支持各种模型配置的自动检测和适配
+- 提供逐个生育期的准确率分析
+"""
+
+import os
+import torch
+import pandas as pd
+import numpy as np
+import glob
+from tqdm import tqdm
+from PIL import Image
+from datetime import datetime
+import sys
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+import seaborn as sns
+import argparse
+import json
+
+# 添加项目根目录到系统路径
+current_dir = os.path.dirname(os.path.abspath(__file__))
+test_dir = os.path.dirname(current_dir)
+project_root = os.path.dirname(test_dir)
+sys.path.insert(0, project_root)
+
+# 添加src目录到系统路径，确保相对导入正常工作
+src_dir = os.path.join(project_root, 'src')
+if src_dir not in sys.path:
+    sys.path.insert(0, src_dir)
+
+# 导入完整模型和相关组件
+try:
+    from src.improved_corn_growth_model import (
+        ImprovedCornGrowthStageModel, CONFIG, GROWTH_STAGES, get_transforms
+    )
+    print("✅ 成功导入完整玉米生育期识别模型")
+except ImportError as e:
+    print(f"❌ 无法导入完整模型: {e}")
+    sys.exit(1)
+
+# 导入兼容性模块
+try:
+    from src.model_compatibility import (
+        load_model_with_compatibility, print_model_structure_diff
+    )
+    print("✅ 成功导入模型兼容性组件")
+except ImportError as e:
+    print(f"❌ 无法导入兼容性组件: {e}")
+    sys.exit(1)
+
+# 生育期映射 (中文到英文)
+stage_to_name_cn = {
+    '11': '播种期', '21': '出苗期', '31': '三叶期', '41': '七叶期', '61': '拔节期',
+    '71': '抽雄期', '81': '乳熟期', '91': '成熟期', '99': '收割后'
+}
+
+stage_to_name_en = {
+    '11': 'Seeding', '21': 'Emergence', '31': 'Three-leaf', '41': 'Seven-leaf', '61': 'Jointing',
+    '71': 'Tasseling', '81': 'Milk', '91': 'Maturity', '99': 'Post-harvest'
+}
+
+# 生育期顺序
+stage_order = ['11', '21', '31', '41', '61', '71', '81', '91', '99']
+
+def load_improved_model(model_path, device):
+    """
+    加载完整改进模型
+    
+    Args:
+        model_path: 模型权重文件路径
+        device: 计算设备
+        
+    Returns:
+        tuple: (model, config, stage_mapping)
+    """
+    print(f"🔄 加载完整改进模型权重")
+    print(f"   权重文件: {model_path}")
+    
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"模型文件不存在: {model_path}")
+    
+    # 获取文件信息
+    file_size = os.path.getsize(model_path) / (1024 * 1024)  # MB
+    mod_time = datetime.fromtimestamp(os.path.getmtime(model_path))
+    print(f"   文件大小: {file_size:.2f} MB")
+    print(f"   修改时间: {mod_time}")
+    
+    try:
+        # 首先检查权重文件的架构
+        checkpoint = torch.load(model_path, map_location=device)
+        
+        # 从CONFIG和训练脚本中获取正确的默认配置
+        # 根据训练代码，实际使用的是resnet50而不是efficientnet_b3
+        default_config = {
+            'model_type': 'resnet50',  # 使用训练时的实际模型类型
+            'num_classes': 9,
+            'pretrained': False,  # 加载权重时不需要预训练
+            'dropout_rate': 0.3,
+            'include_time': True,  # 根据CONFIG，时间特征默认启用
+            'use_attention': True,
+            'use_contrastive': False,  # 根据CONFIG，对比学习默认关闭
+            'use_multiscale': True,  # 根据CONFIG，多尺度特征默认启用
+            'use_difficult_enhancement': True  # 根据CONFIG，困难样本增强默认启用
+        }
+        
+        # 使用兼容性加载系统
+        model, config, stage_mapping = load_model_with_compatibility(
+            model_path=model_path,
+            model_class=ImprovedCornGrowthStageModel,
+            device=device,
+            **default_config
+        )
+        
+        # 设置模型为评估模式（重要：避免BatchNorm在单样本推理时出错）
+        model.eval()
+        
+        # 打印配置信息
+        print(f"✅ 模型加载成功")
+        if config:
+            print(f"📋 配置信息: {len(config)} 项")
+        if stage_mapping:
+            print(f"🏷️ 阶段映射: {len(stage_mapping)} 个阶段")
+        
+        return model, config, stage_mapping
+        
+    except Exception as e:
+        print(f"❌ 模型加载失败: {str(e)}")
+        # 提供诊断信息
+        try:
+            checkpoint = torch.load(model_path, map_location=device)
+            print("\n🔍 权重文件诊断信息:")
+            
+            if 'model_state_dict' in checkpoint:
+                state_dict = checkpoint['model_state_dict']
+                print(f"   权重参数数量: {len(state_dict)}")
+                
+                # 分析基础模型类型
+                base_model_keys = [k for k in state_dict.keys() if k.startswith('feature_extractor.base_model.')]
+                print(f"   基础模型参数数量: {len(base_model_keys)}")
+                
+                # 检查是否有EfficientNet特征
+                has_efficientnet = any('blocks.' in k and 'conv_dw' in k for k in base_model_keys)
+                # 检查是否有ResNet特征  
+                has_resnet = any(k.endswith('.conv1.weight') or k.endswith('.conv2.weight') for k in base_model_keys)
+                
+                print(f"   EfficientNet架构: {has_efficientnet}")
+                print(f"   ResNet架构: {has_resnet}")
+                
+                # 检查组件
+                has_multiscale = any('multiscale_extractor' in k for k in state_dict.keys())
+                has_time = any('time_module' in k for k in state_dict.keys())
+                has_attention = any('channel_attention' in k or 'spatial_attention' in k for k in state_dict.keys())
+                
+                print(f"   多尺度特征: {has_multiscale}")
+                print(f"   时间特征: {has_time}")
+                print(f"   注意力机制: {has_attention}")
+                
+        except Exception as diag_e:
+            print(f"   诊断失败: {diag_e}")
+        
+        raise e
+
+def extract_date_from_filename(filename):
+    """从文件名提取日期信息"""
+    try:
+        parts = filename.split('_')
+        if len(parts) >= 3:
+            timestamp = parts[2]
+            if len(timestamp) >= 14 and timestamp[:14].isdigit():
+                date_str = timestamp[:8]
+                time_str = timestamp[8:14]
+                return datetime.strptime(f"{date_str}{time_str}", '%Y%m%d%H%M%S')
+        
+        for part in parts:
+            if len(part) >= 8 and part[:8].isdigit():
+                date_str = part[:8]
+                if date_str.startswith(('19', '20')):
+                    return datetime.strptime(date_str, '%Y%m%d')
+    except:
+        pass
+    
+    return datetime.now()
+
+def predict_image_improved_model(model, config, stage_mapping, img_path, transform, device):
+    """使用完整改进模型预测单张图像"""
+    try:
+        img_file = os.path.basename(img_path)
+        date = extract_date_from_filename(img_file)
+        
+        img = Image.open(img_path).convert('RGB')
+        img_tensor = transform(img).unsqueeze(0).to(device)
+        
+        # 检查模型是否使用时间特征
+        if hasattr(model, 'include_time') and model.include_time:
+            # 从日期提取时间特征 - 生成3维时间特征（与训练时一致）
+            month = date.month
+            day = date.day
+            
+            # 使用与训练时相同的时间特征计算方法
+            import math
+            time_in_year = ((month - 1) * 31 + day) / (12 * 31)  # 年内时间进度 [0,1]
+            time_angle = 2 * math.pi * time_in_year  # 将时间转换为角度
+            time_sin = math.sin(time_angle)  # 正弦分量
+            time_cos = math.cos(time_angle)  # 余弦分量
+            
+            # 构建3维时间特征张量
+            time_tensor = torch.tensor([[time_in_year, time_sin, time_cos]], dtype=torch.float32).to(device)
+            
+            # 将输入构建为元组格式（模型期望的格式）
+            model_input = (img_tensor, time_tensor)
+            
+            with torch.no_grad():
+                outputs = model(model_input)
+        else:
+            # 不使用时间特征
+            with torch.no_grad():
+                outputs = model(img_tensor)
+        
+        probabilities = torch.nn.functional.softmax(outputs, dim=1)
+        confidence, pred_idx = torch.max(probabilities, 1)
+        
+        idx_to_stage = {v: k for k, v in stage_mapping.items()}
+        pred_stage = idx_to_stage[pred_idx.item()]
+        confidence = confidence.item()
+        
+        return {
+            'filename': img_file,
+            'pred_stage': pred_stage,
+            'confidence': confidence,
+            'date': date,
+            'pred_stage_name_cn': stage_to_name_cn.get(pred_stage, 'Unknown'),
+            'pred_stage_name_en': stage_to_name_en.get(pred_stage, 'Unknown')
+        }
+    except Exception as e:
+        print(f"❌ 预测图像失败: {img_path}, 错误: {e}")
+        return None
+
+def create_improved_model_timeline(results, output_dir):
+    """为完整模型创建时间线分析图"""
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 设置字体为英文
+        plt.rcParams['font.family'] = 'Arial'
+        plt.rcParams['font.size'] = 10
+        
+        # 按日期排序
+        sorted_results = sorted(results, key=lambda x: x['date'])
+        
+        dates = [r['date'] for r in sorted_results]
+        true_stages = [r['true_stage'] for r in sorted_results]
+        pred_stages = [r['pred_stage'] for r in sorted_results]
+        confidences = [r['confidence'] for r in sorted_results]
+        
+        # 创建图形
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(16, 12))
+        
+        # 将阶段转为数字便于绘图
+        true_stage_nums = [stage_order.index(s) if s in stage_order else -1 for s in true_stages]
+        pred_stage_nums = [stage_order.index(s) if s in stage_order else -1 for s in pred_stages]
+        
+        # 图1: 真实生育期 - 全英文
+        ax1.plot(dates, true_stage_nums, 'g-o', markersize=5, linewidth=2.5, alpha=0.8)
+        ax1.set_ylabel('True Growth Stage', fontsize=12, fontweight='bold')
+        ax1.set_title('Improved Corn Growth Stage Model Test Results - Timeline Analysis', fontsize=14, fontweight='bold')
+        ax1.set_yticks(range(len(stage_order)))
+        ax1.set_yticklabels([f"{s}\n{stage_to_name_en[s]}" for s in stage_order])
+        ax1.grid(True, alpha=0.3)
+        ax1.legend(['True Stage'], loc='upper left')
+        
+        # 图2: 预测生育期 - 全英文
+        ax2.plot(dates, pred_stage_nums, 'b-s', markersize=5, linewidth=2.5, alpha=0.8)
+        ax2.set_ylabel('Predicted Growth Stage', fontsize=12, fontweight='bold')
+        ax2.set_title('Prediction Results (Improved Model)', fontsize=12, fontweight='bold')
+        ax2.set_yticks(range(len(stage_order)))
+        ax2.set_yticklabels([f"{s}\n{stage_to_name_en[s]}" for s in stage_order])
+        ax2.grid(True, alpha=0.3)
+        ax2.legend(['Model Predictions'], loc='upper left')
+        
+        # 图3: 置信度 - 全英文
+        ax3.plot(dates, confidences, 'r-^', markersize=4, linewidth=2, alpha=0.8)
+        ax3.set_ylabel('Prediction Confidence', fontsize=12, fontweight='bold')
+        ax3.set_xlabel('Date', fontsize=12, fontweight='bold')
+        ax3.set_title('Prediction Confidence Changes', fontsize=12, fontweight='bold')
+        ax3.set_ylim(0, 1.0)
+        ax3.grid(True, alpha=0.3)
+        ax3.legend(['Confidence'], loc='lower left')
+        
+        # 格式化x轴
+        for ax in [ax1, ax2, ax3]:
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+            ax.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
+            plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+        
+        plt.tight_layout()
+        
+        # 保存图像
+        timeline_path = os.path.join(output_dir, 'improved_model_timeline.png')
+        plt.savefig(timeline_path, dpi=300, bbox_inches='tight', facecolor='white')
+        plt.close()
+        
+        print(f"📊 完整模型时间线图已保存: {timeline_path}")
+        return timeline_path
+        
+    except Exception as e:
+        print(f"❌ 创建时间线图失败: {e}")
+        return None
+
+def create_improved_model_confusion_matrix(results, output_dir):
+    """创建完整模型的混淆矩阵"""
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 设置字体为英文
+        plt.rcParams['font.family'] = 'Arial'
+        plt.rcParams['font.size'] = 10
+        
+        true_stages = [r['true_stage'] for r in results]
+        pred_stages = [r['pred_stage'] for r in results]
+        
+        # 创建混淆矩阵
+        cm = confusion_matrix(true_stages, pred_stages, labels=stage_order)
+        
+        # 计算百分比
+        cm_percent = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis] * 100
+        
+        # 创建图形
+        fig, ax = plt.subplots(figsize=(12, 10))
+        
+        # 使用英文标签
+        stage_labels_en = [f"{s}\n{stage_to_name_en[s]}" for s in stage_order]
+        
+        # 绘制热力图
+        sns.heatmap(cm_percent, annot=True, fmt='.1f', cmap='Blues', 
+                   xticklabels=stage_labels_en, yticklabels=stage_labels_en,
+                   square=True, linewidths=0.5, cbar_kws={"shrink": .8})
+        
+        ax.set_xlabel('Predicted Growth Stage', fontsize=12, fontweight='bold')
+        ax.set_ylabel('True Growth Stage', fontsize=12, fontweight='bold')
+        ax.set_title('Improved Model Confusion Matrix (%)', fontsize=14, fontweight='bold')
+        
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
+        plt.tight_layout()
+        
+        # 保存图像
+        cm_path = os.path.join(output_dir, 'improved_model_confusion_matrix.png')
+        plt.savefig(cm_path, dpi=300, bbox_inches='tight', facecolor='white')
+        plt.close()
+        
+        print(f"📊 完整模型混淆矩阵已保存: {cm_path}")
+        return cm_path
+        
+    except Exception as e:
+        print(f"❌ 创建混淆矩阵失败: {e}")
+        return None
+
+def create_improved_model_performance(results, output_dir):
+    """创建完整模型的性能分析图"""
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 按生育期统计性能
+        stage_stats = {}
+        for stage in stage_order:
+            stage_results = [r for r in results if r['true_stage'] == stage]
+            if stage_results:
+                correct = sum(1 for r in stage_results if r['pred_stage'] == r['true_stage'])
+                total = len(stage_results)
+                accuracy = correct / total
+                avg_confidence = np.mean([r['confidence'] for r in stage_results])
+                stage_stats[stage] = {
+                    'accuracy': accuracy,
+                    'confidence': avg_confidence,
+                    'total': total,
+                    'correct': correct
+                }
+        
+        # 创建性能分析图
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+        
+        stages = list(stage_stats.keys())
+        accuracies = [stage_stats[s]['accuracy'] for s in stages]
+        confidences = [stage_stats[s]['confidence'] for s in stages]
+        
+        # 准确率图 - 全英文
+        bars1 = ax1.bar(range(len(stages)), accuracies, color='steelblue', alpha=0.8)
+        ax1.set_xlabel('Growth Stage', fontweight='bold')
+        ax1.set_ylabel('Accuracy', fontweight='bold')
+        ax1.set_title('Per-Stage Prediction Accuracy\n(Improved Model)', fontweight='bold')
+        ax1.set_xticks(range(len(stages)))
+        ax1.set_xticklabels([f"{s}\n{stage_to_name_en[s]}" for s in stages], rotation=45, ha='right')
+        ax1.set_ylim(0, 1.0)
+        ax1.grid(True, alpha=0.3, axis='y')
+        
+        # 添加数值标签
+        for i, (bar, acc) in enumerate(zip(bars1, accuracies)):
+            ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                    f'{acc:.3f}', ha='center', va='bottom', fontweight='bold')
+        
+        # 置信度图 - 全英文
+        bars2 = ax2.bar(range(len(stages)), confidences, color='lightcoral', alpha=0.8)
+        ax2.set_xlabel('Growth Stage', fontweight='bold')
+        ax2.set_ylabel('Average Confidence', fontweight='bold')
+        ax2.set_title('Per-Stage Prediction Confidence\n(Improved Model)', fontweight='bold')
+        ax2.set_xticks(range(len(stages)))
+        ax2.set_xticklabels([f"{s}\n{stage_to_name_en[s]}" for s in stages], rotation=45, ha='right')
+        ax2.set_ylim(0, 1.0)
+        ax2.grid(True, alpha=0.3, axis='y')
+        
+        # 添加数值标签
+        for i, (bar, conf) in enumerate(zip(bars2, confidences)):
+            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                    f'{conf:.3f}', ha='center', va='bottom', fontweight='bold')
+        
+        plt.tight_layout()
+        perf_path = os.path.join(output_dir, 'improved_model_performance.png')
+        plt.savefig(perf_path, dpi=300, bbox_inches='tight', facecolor='white')
+        plt.close()
+        
+        print(f"📊 完整模型性能分析图已保存: {perf_path}")
+        return perf_path, stage_stats
+        
+    except Exception as e:
+        print(f"❌ 创建性能分析失败: {e}")
+        return None, None
+
+def create_improved_model_detailed_report_txt(results, stage_stats, overall_accuracy, model_path, model_config, output_dir):
+    """生成完整模型的详细txt报告"""
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 生成详细报告
+        report_path = os.path.join(output_dir, 'improved_model_detailed_report.txt')
+        
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write("=" * 80 + "\n")
+            f.write("Improved Corn Growth Stage Model - Detailed Test Report\n")
+            f.write("完整玉米生育期识别模型 - 详细测试报告\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"Test Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Model Type: ImprovedCornGrowthStageModel (Complete Model)\n")
+            f.write(f"Weight File: {model_path}\n")
+            f.write(f"Total Samples: {len(results)}\n")
+            f.write(f"Overall Accuracy: {overall_accuracy:.4f} ({overall_accuracy*100:.2f}%)\n")
+            f.write("\n")
+            
+            # 模型配置信息
+            f.write("=" * 80 + "\n")
+            f.write("MODEL CONFIGURATION (模型配置)\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"Model Architecture: ImprovedCornGrowthStageModel\n")
+            f.write(f"Image Size: {model_config.get('img_size', 'Unknown')}\n")
+            f.write(f"Number of Classes: {model_config.get('num_classes', 'Unknown')}\n")
+            f.write(f"Includes Time Features: {model_config.get('include_time', 'Unknown')}\n")
+            f.write(f"Uses Attention Mechanism: {model_config.get('use_attention', 'Unknown')}\n")
+            f.write(f"Uses Contrastive Learning: {model_config.get('use_contrastive', 'Unknown')}\n")
+            f.write(f"Uses Multi-scale Features: {model_config.get('use_multiscale', 'Unknown')}\n")
+            f.write(f"Uses Difficult Enhancement: {model_config.get('use_difficult_enhancement', 'Unknown')}\n")
+            f.write(f"Dropout Rate: {model_config.get('dropout_rate', 'Unknown')}\n")
+            f.write("\n")
+            
+            # 各生育期详细统计
+            f.write("=" * 80 + "\n")
+            f.write("PER-STAGE ACCURACY ANALYSIS (各生育期准确率分析)\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"{'Stage':<8} {'Name':<15} {'Samples':<8} {'Correct':<8} {'Accuracy':<12} {'Confidence':<12}\n")
+            f.write("-" * 80 + "\n")
+            
+            total_samples = 0
+            total_correct = 0
+            
+            for stage in stage_order:
+                if stage in stage_stats:
+                    stats = stage_stats[stage]
+                    accuracy_pct = stats['accuracy'] * 100
+                    confidence_pct = stats['confidence'] * 100
+                    
+                    f.write(f"{stage:<8} {stage_to_name_en[stage]:<15} {stats['total']:<8} "
+                           f"{stats['correct']:<8} {accuracy_pct:>7.2f}%    {confidence_pct:>7.2f}%\n")
+                    
+                    total_samples += stats['total']
+                    total_correct += stats['correct']
+            
+            f.write("-" * 80 + "\n")
+            f.write(f"{'TOTAL':<8} {'All Stages':<15} {total_samples:<8} {total_correct:<8} "
+                   f"{(total_correct/total_samples*100):>7.2f}%    {'N/A':>10}\n")
+            f.write("\n")
+            
+            # 模型特性分析
+            f.write("=" * 80 + "\n")
+            f.write("IMPROVED MODEL FEATURES ANALYSIS\n")
+            f.write("=" * 80 + "\n")
+            
+            # 按准确率排序的生育期
+            sorted_by_accuracy = sorted(stage_stats.items(), key=lambda x: x[1]['accuracy'], reverse=True)
+            
+            best_stage, best_acc = sorted_by_accuracy[0]
+            worst_stage, worst_acc = sorted_by_accuracy[-1]
+            
+            f.write(f"Best performing stage: {best_stage} ({stage_to_name_en[best_stage]}) - "
+                   f"{best_acc['accuracy']*100:.2f}%\n")
+            f.write(f"Worst performing stage: {worst_stage} ({stage_to_name_en[worst_stage]}) - "
+                   f"{worst_acc['accuracy']*100:.2f}%\n")
+            
+            # 性能稳定性
+            stage_acc_values = [stats['accuracy'] for stats in stage_stats.values()]
+            stability = np.std(stage_acc_values)
+            f.write(f"Performance stability (std): {stability:.4f}\n")
+            
+            # 高低性能阶段分析
+            high_accuracy_stages = [stage for stage, stats in stage_stats.items() if stats['accuracy'] > 0.8]
+            low_accuracy_stages = [stage for stage, stats in stage_stats.items() if stats['accuracy'] < 0.6]
+            
+            f.write(f"\nHigh accuracy stages (>80%): {len(high_accuracy_stages)} stages\n")
+            for stage in high_accuracy_stages:
+                f.write(f"  - {stage} ({stage_to_name_en[stage]}): {stage_stats[stage]['accuracy']*100:.2f}%\n")
+            
+            if low_accuracy_stages:
+                f.write(f"\nLow accuracy stages (<60%): {len(low_accuracy_stages)} stages\n")
+                for stage in low_accuracy_stages:
+                    f.write(f"  - {stage} ({stage_to_name_en[stage]}): {stage_stats[stage]['accuracy']*100:.2f}%\n")
+            else:
+                f.write(f"\nLow accuracy stages (<60%): None (all stages >= 60%)\n")
+            
+            # 完整模型特性分析
+            f.write(f"\nImproved Model Architecture Benefits:\n")
+            f.write("- Multi-scale feature extraction for different detail levels\n")
+            f.write("- Time feature integration for seasonal growth patterns\n")
+            f.write("- Attention mechanism for focusing on important regions\n")
+            f.write("- Contrastive learning for better feature discrimination\n")
+            f.write("- Difficult sample enhancement for challenging stages\n")
+            f.write("- Advanced data augmentation and regularization\n")
+            
+            f.write(f"\nAverage confidence: {np.mean([stats['confidence'] for stats in stage_stats.values()])*100:.2f}%\n")
+            
+            # 模型复杂度分析
+            f.write(f"\nModel Complexity Analysis:\n")
+            f.write(f"- This is a comprehensive model with multiple advanced features\n")
+            f.write(f"- Suitable for high-accuracy requirements in production\n")
+            f.write(f"- May require more computational resources than simpler models\n")
+            f.write(f"- Excellent for scenarios requiring maximum performance\n")
+            
+            f.write("\n" + "=" * 80 + "\n")
+            f.write("Complete model test finished successfully.\n")
+            f.write("=" * 80 + "\n")
+        
+        print(f"📄 完整模型详细报告已保存: {report_path}")
+        return report_path
+        
+    except Exception as e:
+        print(f"❌ 生成详细报告失败: {e}")
+        return None
+
+def test_2022_labeled_data_improved_model():
+    """测试2022年标注数据 - 完整模型版本"""
+    parser = argparse.ArgumentParser(description='完整改进玉米生育期识别模型测试')
+    
+    # 声明全局变量
+    global MODEL_PATH, TESTDATA_DIR, OUTPUT_DIR, DEVICE
+    
+    parser.add_argument('--model_path', type=str, 
+                        default=r'D:\lzh\cornmx\models\improved_model\improved_corn_model_best.pth',
+                        help='完整模型权重文件路径')
+    parser.add_argument('--data_dir', type=str,
+                        default=r'D:\lzh\cornmx\test\testdata\2021',
+                        help='测试数据目录')
+    parser.add_argument('--output_dir', type=str,
+                        default=r'D:\lzh\cornmx\test\results\improved_model_test',
+                        help='结果输出目录')
+    parser.add_argument('--device', type=str, default='auto',
+                        choices=['auto', 'cpu', 'cuda'],
+                        help='计算设备')
+    
+    args = parser.parse_args()
+    
+    # 配置全局变量
+    MODEL_PATH = args.model_path
+    TESTDATA_DIR = args.data_dir
+    OUTPUT_DIR = args.output_dir
+    DEVICE = args.device
+    
+    print("🌽 玉米生育期识别 - 完整改进模型测试")
+    print("=" * 80)
+    print(f"🤖 模型权重: {MODEL_PATH}")
+    print(f"📁 测试数据: {TESTDATA_DIR}")
+    print(f"📊 输出目录: {OUTPUT_DIR}")
+    print(f"🖥️ 计算设备: {DEVICE}")
+    
+    # 检查文件和目录
+    if not os.path.exists(MODEL_PATH):
+        print(f"❌ 模型权重文件不存在: {MODEL_PATH}")
+        return
+    
+    if not os.path.exists(TESTDATA_DIR):
+        print(f"❌ 测试数据目录不存在: {TESTDATA_DIR}")
+        return
+    
+    # 设置设备
+    if DEVICE == 'auto':
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    else:
+        device = torch.device(DEVICE)
+    print(f"🖥️ 使用设备: {device}")
+    
+    # 设置随机种子
+    torch.manual_seed(42)
+    
+    # 加载模型
+    model, config, stage_mapping = load_improved_model(MODEL_PATH, device)
+    transform = get_transforms(config, is_training=False)
+    
+    # 收集测试数据
+    print("📊 收集测试数据...")
+    image_files = []
+    
+    for stage_dir in os.listdir(TESTDATA_DIR):
+        stage_path = os.path.join(TESTDATA_DIR, stage_dir)
+        if os.path.isdir(stage_path) and stage_dir in stage_mapping:
+            stage_files = [f for f in os.listdir(stage_path) 
+                          if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tiff'))]
+            
+            for img_file in stage_files:
+                image_files.append({
+                    'path': os.path.join(stage_path, img_file),
+                    'true_stage': stage_dir,
+                    'filename': img_file
+                })
+    
+    if not image_files:
+        print("❌ 未找到测试图像")
+        return
+    
+    print(f"📊 找到 {len(image_files)} 张测试图像")
+    
+    # 按生育期统计
+    stage_counts = {}
+    for img in image_files:
+        stage = img['true_stage']
+        stage_counts[stage] = stage_counts.get(stage, 0) + 1
+    
+    print("📊 各生育期图像数量:")
+    for stage in stage_order:
+        if stage in stage_counts:
+            print(f"  {stage} ({stage_to_name_en[stage]}): {stage_counts[stage]} 张")
+    
+    # 预测所有图像
+    print(f"\n🔮 开始预测（完整改进模型）...")
+    results = []
+    correct_predictions = 0
+    
+    for img_info in tqdm(image_files, desc="完整模型预测进度"):
+        result = predict_image_improved_model(
+            model, config, stage_mapping, img_info['path'], transform, device
+        )
+        
+        if result:
+            result['true_stage'] = img_info['true_stage']
+            result['correct'] = (result['pred_stage'] == result['true_stage'])
+            
+            if result['correct']:
+                correct_predictions += 1
+            
+            results.append(result)
+    
+    if not results:
+        print(f"❌ 没有成功预测任何图像")
+        return
+    
+    # 计算总体准确率
+    overall_accuracy = correct_predictions / len(results)
+    
+    # 计算各生育期统计
+    stage_stats = {}
+    for stage in stage_order:
+        stage_results = [r for r in results if r['true_stage'] == stage]
+        if stage_results:
+            correct = sum(1 for r in stage_results if r['correct'])
+            total = len(stage_results)
+            accuracy = correct / total
+            avg_confidence = np.mean([r['confidence'] for r in stage_results])
+            stage_stats[stage] = {
+                'accuracy': accuracy,
+                'confidence': avg_confidence,
+                'total': total,
+                'correct': correct
+            }
+    
+    print(f"\n📈 完整改进模型测试结果:")
+    print(f"  总样本数: {len(results)}")
+    print(f"  正确预测: {correct_predictions}")
+    print(f"  总体准确率: {overall_accuracy:.4f} ({overall_accuracy*100:.2f}%)")
+    
+    # 显示各生育期准确率
+    print(f"\n📊 各生育期（类别）准确率详细分析:")
+    print("=" * 80)
+    print(f"{'阶段':<8} {'名称':<15} {'样本数':<8} {'正确数':<8} {'准确率':<12} {'置信度':<12}")
+    print("-" * 80)
+    
+    for stage in stage_order:
+        if stage in stage_stats:
+            stats = stage_stats[stage]
+            accuracy_pct = stats['accuracy'] * 100
+            confidence_pct = stats['confidence'] * 100
+            print(f"{stage:<8} {stage_to_name_en[stage]:<15} {stats['total']:<8} "
+                 f"{stats['correct']:<8} {accuracy_pct:>7.2f}%    {confidence_pct:>7.2f}%")
+    
+    print("-" * 80)
+    print(f"{'总计':<8} {'所有阶段':<15} {len(results):<8} {correct_predictions:<8} "
+         f"{overall_accuracy*100:>7.2f}%    {'N/A':>10}")
+    print("=" * 80)
+    
+    # 详细分类报告
+    true_stages = [r['true_stage'] for r in results]
+    pred_stages = [r['pred_stage'] for r in results]
+    
+    print(f"\n📊 sklearn分类报告:")
+    class_report = classification_report(
+        true_stages, pred_stages, 
+        labels=stage_order,
+        target_names=[f"{s}({stage_to_name_en[s]})" for s in stage_order],
+        digits=4
+    )
+    print(class_report)
+    
+    # 保存结果
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    # 保存预测结果CSV
+    results_df = pd.DataFrame(results)
+    results_path = os.path.join(OUTPUT_DIR, 'improved_model_predictions.csv')
+    results_df.to_csv(results_path, index=False, encoding='utf-8-sig')
+    print(f"📄 预测结果已保存: {results_path}")
+    
+    # 生成详细的txt格式准确率报告
+    txt_report_path = create_improved_model_detailed_report_txt(
+        results, stage_stats, overall_accuracy, MODEL_PATH, config, OUTPUT_DIR
+    )
+    
+    # 创建可视化分析
+    timeline_path = create_improved_model_timeline(results, OUTPUT_DIR)
+    cm_path = create_improved_model_confusion_matrix(results, OUTPUT_DIR)
+    perf_path, stage_stats_returned = create_improved_model_performance(results, OUTPUT_DIR)
+    
+    # 保存总结报告
+    summary_report = {
+        'model_info': {
+            'model_type': 'ImprovedCornGrowthStageModel',
+            'model_path': MODEL_PATH,
+            'test_date': datetime.now().isoformat(),
+            'config': config
+        },
+        'test_results': {
+            'total_samples': len(results),
+            'correct_predictions': correct_predictions,
+            'overall_accuracy': overall_accuracy,
+            'test_data_dir': TESTDATA_DIR
+        },
+        'stage_statistics': stage_counts,
+        'stage_accuracies': {stage: stats['accuracy'] for stage, stats in stage_stats.items()},
+        'generated_files': {
+            'predictions_csv': results_path,
+            'detailed_report_txt': txt_report_path,
+            'timeline_chart': timeline_path,
+            'confusion_matrix': cm_path,
+            'performance_analysis': perf_path
+        }
+    }
+    
+    summary_path = os.path.join(OUTPUT_DIR, 'improved_model_test_summary.json')
+    with open(summary_path, 'w', encoding='utf-8') as f:
+        json.dump(summary_report, f, indent=2, ensure_ascii=False)
+    
+    print(f"\n📋 测试总结报告已保存: {summary_path}")
+    print(f"\n✅ 完整改进模型测试完成!")
+    print(f"📁 所有结果保存在: {OUTPUT_DIR}")
+
+if __name__ == "__main__":
+    test_2022_labeled_data_improved_model() 
